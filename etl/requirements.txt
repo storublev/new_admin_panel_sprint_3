@@ -1,7 +1,5 @@
-backoff==2.2.1
 elasticsearch==8.5.3
-psycopg2_binary==2.9
-python-dotenv==0.21.0
-redis==4.4.0
-pydantic==1.10.4
-orjson==3.8.5
+psycopg2-binary==2.9.9
+python-dotenv==1.0.0
+pydantic>=2.0
+pydantic-settings>=2.0
