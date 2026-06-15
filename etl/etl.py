@@ -17,7 +17,7 @@ import time
 from core.config import settings
 from db.postgres import iter_movie_batches
 from db.elastic import get_es_client, ensure_index, bulk_upload
-from models.dataclasses import Movie
+from models.dataclasses import Movie, Person, Genre
 from state import JsonFileStorage, State
 
 logger = logging.getLogger(__name__)
@@ -43,13 +43,13 @@ def transform_row(row: dict) -> Movie:
     Returns:
         Объект Movie с разделёнными персонами по ролям.
     """
-    actors: list = []
-    directors: list = []
-    writers: list = []
+    actors: list[Person] = []
+    directors: list[Person] = []
+    writers: list[Person] = []
 
     # Разделяем персон по ролям
     for person in row.get("persons", []):
-        p = {"id": person["id"], "name": person["name"], "role": person.get("role")}
+        p = Person(id=person["id"], name=person["name"])
         role = person.get("role", "")
         if role == "actor":
             actors.append(p)
@@ -59,7 +59,7 @@ def transform_row(row: dict) -> Movie:
             writers.append(p)
 
     genres = [
-        {"id": g["id"], "name": g["name"]}
+        Genre(id=g["id"], name=g["name"])
         for g in row.get("genres", [])
     ]
 

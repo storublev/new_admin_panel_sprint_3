@@ -46,7 +46,7 @@ def get_es_client() -> Elasticsearch:
 
     @backoff_es(max_retries=10)
     def _connect():
-        client = Elasticsearch(settings.es_host)
+        client = Elasticsearch(settings.elastic_host)
         client.info()  # Проверка доступности
         return client
 
