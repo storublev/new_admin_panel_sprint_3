@@ -128,7 +128,11 @@ def run_etl() -> None:
                 logger.info("Загружено %d документов.", success_count)
 
                 # Сохраняем дату последнего обработанного фильма
-                new_last_modified = batch[-1]["modified"]
+                raw_modified = batch[-1]["modified"]
+                if hasattr(raw_modified, "isoformat"):
+                    new_last_modified = raw_modified.isoformat()
+                else:
+                    new_last_modified = str(raw_modified)
                 state.set(STATE_KEY, new_last_modified)
 
             logger.info(

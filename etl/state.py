@@ -6,9 +6,19 @@
 
 import json
 import logging
+from datetime import datetime
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+class DateTimeEncoder(json.JSONEncoder):
+    """JSON-сериализатор, поддерживающий datetime."""
+
+    def default(self, obj: Any) -> Any:
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        return super().default(obj)
 
 
 class JsonFileStorage:
@@ -21,7 +31,7 @@ class JsonFileStorage:
         """Сохраняет словарь состояния в JSON-файл."""
         try:
             with open(self._file_path, "w", encoding="utf-8") as f:
-                json.dump(state, f)
+                json.dump(state, f, cls=DateTimeEncoder)
         except OSError as exc:
             logger.error("Не удалось сохранить состояние: %s", exc)
 
