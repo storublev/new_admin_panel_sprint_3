@@ -112,7 +112,7 @@ def run_etl() -> None:
             ensure_index(es)
 
             last_modified = state.get(STATE_KEY, "1970-01-01 00:00:00.000000")
-            logger.info("Загружаю фильмы, изменённые после %s", last_modified)
+            logger.info(f"Загружаю фильмы, изменённые после {last_modified}")
 
             # Итерируемся по батчам
             batch_generator = iter_movie_batches(last_modified, settings.batch_size)
@@ -136,13 +136,12 @@ def run_etl() -> None:
                 state.set(STATE_KEY, new_last_modified)
 
             logger.info(
-                "Цикл завершён. Следующая проверка через %d с.",
-                settings.poll_interval,
+                f'Цикл завершён. Следующая проверка через {settings.poll_interval} с.'
             )
 
         except Exception as exc:
-            logger.error("Ошибка в ETL-цикле: %s", exc, exc_info=True)
-            logger.info("Повторная попытка через %d с…", settings.poll_interval)
+            logger.error(f"Ошибка в ETL-цикле: {exc}", exc_info=True)
+            logger.info(f"Повторная попытка через {settings.poll_interval} с…")
 
         time.sleep(settings.poll_interval)
 

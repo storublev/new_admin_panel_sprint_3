@@ -33,7 +33,7 @@ class JsonFileStorage:
             with open(self._file_path, "w", encoding="utf-8") as f:
                 json.dump(state, f, cls=DateTimeEncoder)
         except OSError as exc:
-            logger.error("Не удалось сохранить состояние: %s", exc)
+            logger.error(f"Не удалось сохранить состояние: {exc}")
 
     def load(self) -> dict[str, Any]:
         """Загружает состояние из JSON-файла.

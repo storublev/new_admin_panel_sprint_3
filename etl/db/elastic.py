@@ -77,7 +77,22 @@ def bulk_upload(client: Elasticsearch, documents: list[dict]) -> int:
     Returns:
         Количество успешно загруженных документов.
     """
-    success, errors = helpers.bulk(client, documents, stats_only=True, raise_on_error=False)
+    errors: list[dict] = []
+    success = 0
+    for ok, result in helpers.streaming_bulk(
+        client, documents, raise_on_error=False,
+    ):
+        if ok:
+            success += 1
+        else:
+            errors.append(result)
+            if len(errors) <= 5:
+                logger.error(f"Ошибка bulk: {result}")
+
     if errors:
-        logger.warning("При загрузке произошло %d ошибок.", errors)
+        logger.warning(
+            f"Загрузка: успешно={success}, всего ошибок={len(errors)}",
+        )
+    else:
+        logger.info("Загружено %d документов.", success)
     return success
