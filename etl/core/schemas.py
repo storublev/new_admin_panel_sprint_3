@@ -64,6 +64,8 @@ MOVIES_MAPPING = {
         "directors": PERSON_MAPPING,
         "actors": PERSON_MAPPING,
         "writers": PERSON_MAPPING,
+        "actors_names": {"type": "text", "analyzer": "ru_en"},
+        "writers_names": {"type": "text", "analyzer": "ru_en"},
     },
 }
 
