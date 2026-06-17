@@ -1,22 +1,13 @@
-"""ETL-процесс: перенос данных из PostgreSQL в Elasticsearch.
-
-Основной цикл:
-  1. Подключение к PostgreSQL и Elasticsearch.
-  2. Чтение состояния (даты последней загрузки).
-  3. Извлечение фильмов из PostgreSQL (батчами по batch_size).
-  4. Трансформация строк в формат документов Elasticsearch.
-  5. Загрузка в Elasticsearch через bulk API.
-  6. Обновление состояния.
-  7. Ожидание poll_interval секунд, затем повтор.
-"""
+"""ETL-процесс: перенос данных из PostgreSQL в Elasticsearch."""
 
 import logging
 import sys
 import time
+from typing import Optional
 
 from core.config import settings
-from db.postgres import iter_movie_batches
-from db.elastic import get_es_client, ensure_index, bulk_upload
+from db.postgres import iter_movie_batches, count_modified_movies
+from db.elastic import get_es_client, ensure_index, bulk_upload_with_progress
 from models.dataclasses import Movie, Person, Genre
 from state import JsonFileStorage, State
 
@@ -35,19 +26,11 @@ def configure_logging() -> None:
 
 
 def transform_row(row: dict) -> Movie:
-    """Преобразует строку из БД в объект Movie.
-
-    Args:
-        row: Словарь с данными из PostgreSQL.
-
-    Returns:
-        Объект Movie с разделёнными персонами по ролям.
-    """
+    """Преобразует строку из БД в объект Movie."""
     actors: list[Person] = []
     directors: list[Person] = []
     writers: list[Person] = []
 
-    # Разделяем персон по ролям
     for person in row.get("persons", []):
         p = Person(id=person["id"], name=person["name"])
         role = person.get("role", "")
@@ -77,14 +60,7 @@ def transform_row(row: dict) -> Movie:
 
 
 def to_bulk_action(movie: Movie) -> dict:
-    """Формирует bulk-действие для Elasticsearch.
-
-    Args:
-        movie: Объект фильма.
-
-    Returns:
-        Словарь для helpers.bulk().
-    """
+    """Формирует bulk-действие для Elasticsearch."""
     return {
         "_index": "movies",
         "_id": movie.id,
@@ -93,56 +69,85 @@ def to_bulk_action(movie: Movie) -> dict:
 
 
 def run_etl() -> None:
-    """Запускает ETL-процесс.
-
-    В бесконечном цикле:
-      - проверяет подключения,
-      - читает новые/изменённые фильмы из PostgreSQL,
-      - загружает их в Elasticsearch.
-    """
-    logger.info("Запуск ETL-процесса…")
+    """Запускает ETL-процесс."""
+    logger.info("🚀 Запуск ETL-процесса…")
 
     storage = JsonFileStorage(settings.state_file)
     state = State(storage)
 
+    cycle_count = 0
+
     while True:
+        cycle_count += 1
+        logger.info(f"🔄 Цикл ETL #{cycle_count}")
+
         try:
             # Проверяем подключения
+            logger.info("🔌 Подключение к Elasticsearch...")
             es = get_es_client()
             ensure_index(es)
+            logger.info("✅ Подключение к Elasticsearch установлено")
 
+            # Получаем дату последней загрузки
             last_modified = state.get(STATE_KEY, "1970-01-01 00:00:00.000000")
-            logger.info(f"Загружаю фильмы, изменённые после {last_modified}")
+            logger.info(f"📅 Загружаю фильмы, изменённые после {last_modified}")
 
-            # Итерируемся по батчам
+            # Проверяем, есть ли новые данные
+            count = count_modified_movies(last_modified)
+            logger.info(f"📊 Найдено {count} новых/изменённых фильмов")
+
+            if count == 0:
+                logger.info("⏸️ Новых данных нет, ожидаем...")
+                time.sleep(settings.poll_interval)
+                continue
+
+            # Получаем генератор батчей
             batch_generator = iter_movie_batches(last_modified, settings.batch_size)
+
+            processed_count = 0
             new_last_modified = last_modified
 
-            for batch in batch_generator:
-                logger.info("Обрабатываю батч из %d записей…", len(batch))
+            # Обрабатываем батчи
+            for batch_index, batch in enumerate(batch_generator, 1):
+                logger.info(f"📦 Обрабатываю батч #{batch_index} из {len(batch)} записей")
 
+                # Трансформация данных
                 transformed = [transform_row(row) for row in batch]
                 bulk_actions = [to_bulk_action(m) for m in transformed]
 
-                success_count = bulk_upload(es, bulk_actions)
-                logger.info("Загружено %d документов.", success_count)
+                # Загрузка в Elasticsearch
+                success_count = bulk_upload_with_progress(es, bulk_actions, batch_size=500)
+                processed_count += success_count
 
-                # Сохраняем дату последнего обработанного фильма
-                raw_modified = batch[-1]["modified"]
-                if hasattr(raw_modified, "isoformat"):
-                    new_last_modified = raw_modified.isoformat()
-                else:
-                    new_last_modified = str(raw_modified)
+                logger.info(f"✅ Загружено {success_count} документов. Всего: {processed_count}/{count}")
+
+            # Сохраняем состояние
+            if processed_count > 0:
+                # Получаем финальную дату из итератора
+                final_date = getattr(batch_generator, 'gi_frame', None)
+                if final_date:
+                    # Если итератор вернул значение
+                    try:
+                        final_modified = next(batch_generator, None)
+                        if final_modified:
+                            new_last_modified = final_modified
+                    except StopIteration:
+                        pass
+
                 state.set(STATE_KEY, new_last_modified)
-
-            logger.info(
-                f'Цикл завершён. Следующая проверка через {settings.poll_interval} с.'
-            )
+                logger.info(f"💾 Состояние сохранено: {new_last_modified}")
+                logger.info(f"✅ Обработано {processed_count} фильмов")
+            else:
+                logger.warning("⚠️ Не обработано ни одного фильма")
 
         except Exception as exc:
-            logger.error(f"Ошибка в ETL-цикле: {exc}", exc_info=True)
-            logger.info(f"Повторная попытка через {settings.poll_interval} с…")
+            logger.error(f"❌ Ошибка в ETL-цикле: {exc}", exc_info=True)
+            logger.info(f"⏳ Повторная попытка через {settings.poll_interval} с…")
+            time.sleep(settings.poll_interval * 2)
+            continue
 
+        # Пауза перед следующим циклом
+        logger.info(f"⏳ Ожидание {settings.poll_interval} с перед следующим циклом...")
         time.sleep(settings.poll_interval)
 
 
@@ -152,7 +157,7 @@ def main() -> None:
     try:
         run_etl()
     except KeyboardInterrupt:
-        logger.info("ETL остановлен пользователем.")
+        logger.info("🛑 ETL остановлен пользователем.")
 
 
 if __name__ == "__main__":

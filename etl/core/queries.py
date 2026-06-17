@@ -11,13 +11,24 @@ WITH recently_modified AS (
     WHERE fw.modified > '{last_modified}'
        OR g.modified   > '{last_modified}'
        OR p.modified   > '{last_modified}'
+),
+ordered_movies AS (
+    SELECT fw.id,
+           fw.rating            AS imdb_rating,
+           fw.title,
+           fw.description,
+           fw.modified,
+           fw.creation_date,
+           ROW_NUMBER() OVER (ORDER BY fw.modified, fw.id) AS row_num
+    FROM content.film_work fw
+    WHERE fw.id IN (SELECT id FROM recently_modified)
 )
-SELECT fw.id,
-       fw.rating            AS imdb_rating,
-       fw.title,
-       fw.description,
-       fw.modified,
-       fw.creation_date,
+SELECT om.id,
+       om.imdb_rating,
+       om.title,
+       om.description,
+       om.modified,
+       om.creation_date,
        COALESCE(
            json_agg(
                DISTINCT jsonb_build_object('id', g.id, 'name', g.name)
@@ -34,13 +45,24 @@ SELECT fw.id,
            ) FILTER (WHERE p.id IS NOT NULL),
            '[]'::json
        ) AS persons
-FROM content.film_work fw
-LEFT JOIN content.genre_film_work  gfw  ON gfw.film_work_id = fw.id
+FROM ordered_movies om
+LEFT JOIN content.genre_film_work  gfw  ON gfw.film_work_id = om.id
 LEFT JOIN content.genre            g    ON g.id = gfw.genre_id
-LEFT JOIN content.person_film_work pfw  ON pfw.film_work_id = fw.id
+LEFT JOIN content.person_film_work pfw  ON pfw.film_work_id = om.id
 LEFT JOIN content.person           p    ON p.id = pfw.person_id
-WHERE fw.id IN (SELECT id FROM recently_modified)
-GROUP BY fw.id, fw.rating, fw.title, fw.description, fw.modified, fw.creation_date
-ORDER BY fw.modified
-LIMIT {limit};
+WHERE om.row_num > {offset} AND om.row_num <= {offset} + {limit}
+GROUP BY om.id, om.imdb_rating, om.title, om.description, om.modified, om.creation_date
+ORDER BY om.modified, om.id
+"""
+
+COUNT_MODIFIED_MOVIES = """
+SELECT COUNT(DISTINCT fw.id)
+FROM content.film_work fw
+LEFT JOIN content.genre_film_work  gfw ON gfw.film_work_id = fw.id
+LEFT JOIN content.genre            g   ON g.id = gfw.genre_id
+LEFT JOIN content.person_film_work pfw ON pfw.film_work_id = fw.id
+LEFT JOIN content.person           p   ON p.id = pfw.person_id
+WHERE fw.modified > '{last_modified}'
+   OR g.modified   > '{last_modified}'
+   OR p.modified   > '{last_modified}'
 """

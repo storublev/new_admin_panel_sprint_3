@@ -39,8 +39,9 @@ services:
       - xpack.security.enabled=false
       - USE_SSL=false
     container_name: elastic_compose
-    expose:
-      - 9200
+    ports:
+      - "9200:9200"  # Пробрасываем порт 9200 на хост
+      - "9300:9300"  # Опционально - для межнодового общения
     volumes:
       - elastic_volume_compose:/usr/share/elasticsearch/data
 
