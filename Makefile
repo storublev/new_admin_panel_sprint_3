@@ -1,21 +1,14 @@
-dev-up:
-	docker-compose -f docker-compose.dev.yml up -d
-
-prod-up:
-	docker-compose up -d
+full-up:
+	sudo docker-compose down -v && sudo docker-compose -f docker-compose.yml build --no-cache etl  && sudo docker-compose -f docker-compose.yml up -d
 
 load-data:
-	docker-compose exec -it etl sh -c "python etl.py"
-
-full-up:
-	make dev-up
-	make load-data
+	sudo docker-compose exec -it etl sh -c "python etl.py"
 
 stop:
-	docker-compose stop
+	sudo docker-compose stop
 
 remove:
-	docker-compose down
+	sudo docker-compose down
 
 remove-all:
-	docker-compose down -v
+	sudo docker-compose down -v
