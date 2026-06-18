@@ -14,8 +14,8 @@ services:
     volumes:
       - postgresql_volume_compose:/var/lib/postgresql/data
       - ./etl/dump.sql:/docker-entrypoint-initdb.d/dump.sql
-    ports:
-      - "5432:5432"
+    expose:
+      - 5432
 
   redis:
     image: redis:7.0.7
@@ -28,31 +28,38 @@ services:
       retries: 20
     volumes:
       - redis_volume:/data
-    ports:
-      - "6379:6379"
+    expose:
+      - 6379
 
   elastic:
     image: elasticsearch:8.5.3
     environment:
       - discovery.type=single-node
-      - ES_JAVA_OPTS=-Xms1g -Xmx1g
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m   # Минимальная память
       - xpack.security.enabled=false
       - USE_SSL=false
     container_name: elastic_compose
     ports:
-      - "9200:9200"
+      - "9200:9200"  # Пробрасываем порт 9200 на хост
+      - "9300:9300"  # Опционально - для межнодового общения
     volumes:
       - elastic_volume_compose:/usr/share/elasticsearch/data
+#    healthcheck:
+#      test: [ "CMD", "curl", "-f", "http://localhost:9200/_cluster/health" ]
+#      interval: 10s
+#      timeout: 20s
+#      retries: 5
 
   kibana:
     image: kibana:8.5.3
     environment:
       - ELASTICSEARCH_HOSTS=["http://elastic:9200"]
-    ports:
-      - "5601:5601"
+    expose:
+      - 5601
     container_name: kibana_compose
     depends_on:
       - elastic
+#        condition: service_healthy
     volumes:
       - kibana_volume_compose:/usr/share/kibana/data
 
@@ -66,7 +73,9 @@ services:
         condition: service_healthy
     container_name: etl_container
     restart: unless-stopped
-
+    volumes:
+      - ./etl/state:/opt/etl/state
+      - ./etl/logs:/opt/etl/logs
 
 volumes:
   postgresql_volume_compose:

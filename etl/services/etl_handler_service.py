@@ -10,7 +10,7 @@ from pydantic import errors as pydantic_errors
 from services.elastic_loader_service import ElasticsearchLoader
 from services.postgres_extractor_service import PostgresExtractor
 from services.state_service import State
-from settings import SLEEP_TIME_SECONDS, ETLConfig
+from core.config import sleep_time_seconds, ETLConfig
 
 
 @dataclass
