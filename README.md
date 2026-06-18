@@ -25,7 +25,7 @@ PostgreSQL переносятся в БД Elasticsearch.
 выполнить команду `make full-up`.
 
 Данная команда является составной и выполняет следующее:
-1. создаст контейнеры на основе `docker-compose.dev.yml` файла,
+1. создаст контейнеры на основе `docker-compose.yml` файла,
 а также именованные `volume`, предназначенные для хранения файлов, данных из БД и т.п..
 2. запустит ETL-script для переноса данных в хранилище Elasticsearch
 
@@ -50,4 +50,62 @@ _3. не менее 1 Гб свободного пространства на ж
 Данные запрашиваются из PostgreSQL и загружаются в Elasticsearch пачками размером не более 100 записей.
 В процессе переноса данных отслеживаются изменения в PostgreSQL, и вносимые изменения переносятся 
 в Elasticsearch. 
-В качестве хранимого состояния используется дата последнего изменения фильма, жанра или персоны.
+В качестве хранимого состояния используется отдельная таблица audit_log
+
+Пример для тестового добавления фильма:
+-- Добавляем тестовый фильм
+INSERT INTO content.film_work (
+    id, 
+    title, 
+    description, 
+    rating, 
+    type, 
+    modified, 
+    creation_date
+)
+VALUES (
+    gen_random_uuid(),
+    'Тестовый фильм ETL ' || NOW(),
+    'Это тестовый фильм для проверки ETL. Создан в ' || NOW(),
+    (random() * 4 + 5)::numeric(3,1),  -- Рейтинг от 5 до 9
+    'movie',
+    NOW(),
+    NOW()
+);
+-- Проверяем, что триггер сработал
+SELECT 
+    al.id,
+    al.record_id,
+    al.operation,
+    al.processed,
+    al.changed_at,
+    fw.title
+FROM content.audit_log al
+JOIN content.film_work fw ON fw.id::VARCHAR = al.record_id
+WHERE al.table_name = 'film_work'
+AND al.operation = 'I'
+ORDER BY al.id DESC
+LIMIT 5;
+
+## 1. Проверить, что фильм добавился в БД
+docker-compose exec db psql -U app -d movies_database -c "
+SELECT id, title, type, rating FROM content.film_work 
+WHERE title LIKE '%Тестовый%' 
+ORDER BY created_at DESC 
+LIMIT 5;
+"
+
+## 2. Проверить audit_log
+docker-compose exec db psql -U app -d movies_database -c "
+SELECT id, record_id, operation, processed, changed_at 
+FROM content.audit_log 
+WHERE table_name = 'film_work' 
+ORDER BY id DESC 
+LIMIT 5;
+"
+
+## 3. Проверить Elasticsearch
+curl -s "http://localhost:9200/movies/_search?q=*&size=5" | python -m json.tool
+
+## 4. Проверить количество документов в Elasticsearch
+curl -s "http://localhost:9200/movies/_count" | python -m json.tool
