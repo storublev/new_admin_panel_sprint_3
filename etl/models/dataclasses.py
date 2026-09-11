@@ -60,3 +60,16 @@ class Movie:
             "actors_names": [p.name for p in self.actors],
             "writers_names": [p.name for p in self.writers],
         }
+
+
+@dataclass
+class GenreDocument:
+    """Жанр для индекса genres."""
+
+    id: str
+    name: str
+    description: Optional[str] = None
+
+    def to_es_document(self) -> dict:
+        """Преобразует жанр в документ для Elasticsearch."""
+        return asdict(self)

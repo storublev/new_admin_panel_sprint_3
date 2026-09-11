@@ -73,3 +73,23 @@ MOVIES_INDEX_BODY = {
     "settings": INDEX_SETTINGS,
     "mappings": MOVIES_MAPPING,
 }
+
+GENRES_INDEX = "genres"
+
+GENRES_MAPPING = {
+    "dynamic": "strict",
+    "properties": {
+        "id": {"type": "keyword"},
+        "name": {
+            "type": "text",
+            "analyzer": "ru_en",
+            "fields": {"raw": {"type": "keyword"}},
+        },
+        "description": {"type": "text", "analyzer": "ru_en"},
+    },
+}
+
+GENRES_INDEX_BODY = {
+    "settings": INDEX_SETTINGS,
+    "mappings": GENRES_MAPPING,
+}
