@@ -3,7 +3,7 @@
 
 Основной функционал:
 1. Отслеживание изменений в PostgreSQL через таблицу аудита
-2. Синхронизация данных с Elasticsearch: индексы movies и genres
+2. Синхронизация данных с Elasticsearch: индексы movies, genres и persons
 3. Обработка INSERT, UPDATE, DELETE операций
 4. Хранение состояния в PostgreSQL
 5. Автоматическое восстановление после сбоев
@@ -17,7 +17,7 @@ from typing import Any, Dict, Iterable, List, Set, Tuple
 
 from core.config import settings
 from core.queries import FETCH_FILM_IDS_BY_GENRES, FETCH_FILM_IDS_BY_PERSONS, FETCH_IDS_PAGE
-from core.schemas import GENRES_INDEX, MOVIES_INDEX
+from core.schemas import GENRES_INDEX, MOVIES_INDEX, PERSONS_INDEX
 from db.elastic import ensure_index, get_es_client, sync_documents
 from db.postgres import backoff, get_pg_connection
 from pipelines import PIPELINES, Pipeline
@@ -90,6 +90,7 @@ def collect_affected_ids(
             if is_update and _changed(change, "name"):
                 renamed_genres.add(record_id)
         elif table == "person":
+            affected[PERSONS_INDEX].add(record_id)
             if is_update and _changed(change, "full_name"):
                 renamed_persons.add(record_id)
         elif table == "genre_film_work":
@@ -97,6 +98,7 @@ def collect_affected_ids(
             affected[GENRES_INDEX] |= _values(change, "genre_id")
         elif table == "person_film_work":
             affected[MOVIES_INDEX] |= _values(change, "film_work_id")
+            affected[PERSONS_INDEX] |= _values(change, "person_id")
 
     return affected, renamed_genres, renamed_persons
 

@@ -8,14 +8,16 @@
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List
 
-from core.queries import FETCH_GENRES_BY_IDS, FETCH_MOVIES_BY_IDS
+from core.queries import FETCH_GENRES_BY_IDS, FETCH_MOVIES_BY_IDS, FETCH_PERSONS_BY_IDS
 from core.schemas import (
     GENRES_INDEX,
     GENRES_INDEX_BODY,
     MOVIES_INDEX,
     MOVIES_INDEX_BODY,
+    PERSONS_INDEX,
+    PERSONS_INDEX_BODY,
 )
-from models.dataclasses import Genre, GenreDocument, Movie, Person
+from models.dataclasses import Genre, GenreDocument, Movie, Person, PersonDocument, PersonFilm
 
 
 @dataclass(frozen=True)
@@ -87,6 +89,15 @@ def genre_document(row: Dict[str, Any]) -> Dict[str, Any]:
     ).to_es_document()
 
 
+def person_document(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Документ индекса persons."""
+    return PersonDocument(
+        id=row["id"],
+        full_name=row["full_name"],
+        films=[PersonFilm(id=film["id"], roles=film["roles"]) for film in row["films"]],
+    ).to_es_document()
+
+
 MOVIES_PIPELINE = Pipeline(
     index=MOVIES_INDEX,
     index_body=MOVIES_INDEX_BODY,
@@ -103,4 +114,12 @@ GENRES_PIPELINE = Pipeline(
     transform=genre_document,
 )
 
-PIPELINES = (MOVIES_PIPELINE, GENRES_PIPELINE)
+PERSONS_PIPELINE = Pipeline(
+    index=PERSONS_INDEX,
+    index_body=PERSONS_INDEX_BODY,
+    table="person",
+    query=FETCH_PERSONS_BY_IDS,
+    transform=person_document,
+)
+
+PIPELINES = (MOVIES_PIPELINE, GENRES_PIPELINE, PERSONS_PIPELINE)

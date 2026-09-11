@@ -93,3 +93,30 @@ GENRES_INDEX_BODY = {
     "settings": INDEX_SETTINGS,
     "mappings": GENRES_MAPPING,
 }
+
+PERSONS_INDEX = "persons"
+
+PERSONS_MAPPING = {
+    "dynamic": "strict",
+    "properties": {
+        "id": {"type": "keyword"},
+        "full_name": {
+            "type": "text",
+            "analyzer": "ru_en",
+            "fields": {"raw": {"type": "keyword"}},
+        },
+        "films": {
+            "type": "nested",
+            "dynamic": "strict",
+            "properties": {
+                "id": {"type": "keyword"},
+                "roles": {"type": "keyword"},
+            },
+        },
+    },
+}
+
+PERSONS_INDEX_BODY = {
+    "settings": INDEX_SETTINGS,
+    "mappings": PERSONS_MAPPING,
+}

@@ -73,3 +73,24 @@ class GenreDocument:
     def to_es_document(self) -> dict:
         """Преобразует жанр в документ для Elasticsearch."""
         return asdict(self)
+
+
+@dataclass
+class PersonFilm:
+    """Фильм персоны и её роли в этом фильме."""
+
+    id: str
+    roles: list[str] = field(default_factory=list)
+
+
+@dataclass
+class PersonDocument:
+    """Персона для индекса persons."""
+
+    id: str
+    full_name: str
+    films: list[PersonFilm] = field(default_factory=list)
+
+    def to_es_document(self) -> dict:
+        """Преобразует персону в документ для Elasticsearch."""
+        return asdict(self)

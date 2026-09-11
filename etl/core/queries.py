@@ -55,6 +55,28 @@ WHERE g.id = ANY(%(ids)s::uuid[])
   )
 """
 
+# Персоны по списку ID с их фильмами и ролями в каждом фильме.
+# Персоны без фильмов в выборку не попадают (INNER JOIN).
+FETCH_PERSONS_BY_IDS = """
+SELECT p.id,
+       p.full_name,
+       json_agg(
+           json_build_object('id', pf.film_work_id, 'roles', pf.roles)
+           ORDER BY pf.film_work_id
+       ) AS films
+FROM content.person p
+JOIN (
+    SELECT pfw.person_id,
+           pfw.film_work_id,
+           array_agg(DISTINCT pfw.role ORDER BY pfw.role) AS roles
+    FROM content.person_film_work pfw
+    WHERE pfw.person_id = ANY(%(ids)s::uuid[])
+    GROUP BY pfw.person_id, pfw.film_work_id
+) pf ON pf.person_id = p.id
+WHERE p.id = ANY(%(ids)s::uuid[])
+GROUP BY p.id, p.full_name
+"""
+
 # Фильмы, в которые входят жанры / персоны: при переименовании жанра или
 # персоны нужно переиндексировать все их фильмы.
 FETCH_FILM_IDS_BY_GENRES = """
