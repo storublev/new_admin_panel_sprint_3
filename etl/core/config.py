@@ -37,6 +37,8 @@ class Settings:
     sleep_time: int = int(os.getenv("SLEEP_TIME", "1"))
     state_file: str = os.getenv("STATE_FILE", str(BASE_DIR / "state" / "state.json"))
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
+    # Сколько лет после выхода фильм доступен только по подписке (см. access.py)
+    subscription_period_years: int = int(os.getenv("SUBSCRIPTION_PERIOD_YEARS", "3"))
 
 @dataclass
 class ETLConfig:

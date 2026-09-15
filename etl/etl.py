@@ -3,7 +3,7 @@
 
 Основной функционал:
 1. Отслеживание изменений в PostgreSQL через таблицу аудита
-2. Синхронизация данных с Elasticsearch
+2. Синхронизация данных с Elasticsearch: индексы movies, genres и persons
 3. Обработка INSERT, UPDATE, DELETE операций
 4. Хранение состояния в PostgreSQL
 5. Автоматическое восстановление после сбоев
@@ -12,15 +12,22 @@
 import logging
 import sys
 import time
-from datetime import datetime
-from typing import Any, Dict, List, Optional
+from datetime import date, datetime
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
+from access import subscription_threshold
 from core.config import settings
-from core.queries import FETCH_MOVIE_BY_ID
-from db.elastic import get_es_client, ensure_index, bulk_upload_with_progress, bulk_upload
-from db.postgres import get_pg_connection, backoff
-from models.dataclasses import Movie, Person, Genre
-from state import State, DatabaseStateStorage
+from core.queries import (
+    FETCH_FILM_IDS_BY_GENRES,
+    FETCH_FILM_IDS_BY_PERSONS,
+    FETCH_FILM_IDS_LEAVING_SUBSCRIPTION,
+    FETCH_IDS_PAGE,
+)
+from core.schemas import GENRES_INDEX, MOVIES_INDEX, PERSONS_INDEX
+from db.elastic import ensure_index, get_es_client, sync_documents
+from db.postgres import backoff, get_pg_connection
+from pipelines import MOVIES_PIPELINE, PIPELINES, Pipeline
+from state import DatabaseStateStorage, State
 
 # Настройка логирования
 logging.basicConfig(
@@ -34,66 +41,74 @@ logger = logging.getLogger(__name__)
 
 # Константы
 STATE_KEY_AUDIT = "last_audit_id"
-STATE_KEY_MODIFIED = "last_modified"
-MOVIES_INDEX = "movies"
+# Прогресс начальной загрузки индекса: последний загруженный ID или LOAD_DONE
+STATE_KEY_INITIAL_LOAD = "initial_load:{index}"
+LOAD_DONE = "done"
+# Дата, на которую метки доступа фильмов в индексе актуальны
+STATE_KEY_ACCESS_LEVELS = "access_levels_date"
+MIN_UUID = "00000000-0000-0000-0000-000000000000"
 
 
-def transform_row_to_movie(row: Dict[str, Any]) -> Movie:
-    """Преобразует строку из БД в объект Movie.
-
-    Args:
-        row: Словарь с данными фильма из PostgreSQL
-
-    Returns:
-        Объект Movie с разделенными персонами по ролям
-    """
-    actors: List[Person] = []
-    directors: List[Person] = []
-    writers: List[Person] = []
-
-    # Разделяем персон по ролям
-    for person in row.get("persons", []):
-        p = Person(id=person["id"], name=person["name"])
-        role = person.get("role", "")
-        if role == "actor":
-            actors.append(p)
-        elif role == "director":
-            directors.append(p)
-        elif role == "writer":
-            writers.append(p)
-
-    genres = [
-        Genre(id=g["id"], name=g["name"])
-        for g in row.get("genres", [])
-    ]
-
-    return Movie(
-        id=row["id"],
-        title=row["title"],
-        description=row.get("description"),
-        imdb_rating=row.get("imdb_rating"),
-        creation_date=row.get("creation_date"),
-        genres=genres,
-        actors=actors,
-        directors=directors,
-        writers=writers,
-    )
+def _changed(change: Dict[str, Any], field: str) -> bool:
+    """Изменилось ли поле записи в UPDATE."""
+    old_data = change.get("old_data") or {}
+    new_data = change.get("new_data") or {}
+    return old_data.get(field) != new_data.get(field)
 
 
-def to_bulk_action(movie: Movie) -> Dict[str, Any]:
-    """Формирует bulk-действие для Elasticsearch.
+def _values(change: Dict[str, Any], field: str) -> Set[str]:
+    """Значения поля до и после изменения.
 
-    Args:
-        movie: Объект фильма
-
-    Returns:
-        Словарь для индексации в Elasticsearch
+    Связь могла переехать с одной записи на другую, поэтому обновлять
+    нужно обе стороны.
     """
     return {
-        "_index": MOVIES_INDEX,
-        "_id": movie.id,
-        "_source": movie.to_es_document(),
+        str(data[field])
+        for data in (change.get("old_data"), change.get("new_data"))
+        if data and data.get(field)
     }
+
+
+def collect_affected_ids(
+    changes: List[Dict[str, Any]],
+) -> Tuple[Dict[str, Set[str]], Set[str], Set[str]]:
+    """Определяет по записям аудита, какие документы каких индексов обновить.
+
+    Args:
+        changes: Записи из content.audit_log
+
+    Returns:
+        ID документов по индексам, а также ID переименованных жанров и
+        персон: их фильмы тоже нужно переиндексировать, в документе фильма
+        хранятся имена.
+    """
+    affected: Dict[str, Set[str]] = {pipeline.index: set() for pipeline in PIPELINES}
+    renamed_genres: Set[str] = set()
+    renamed_persons: Set[str] = set()
+
+    for change in changes:
+        table = change["table_name"]
+        record_id = str(change["record_id"])
+        is_update = change["operation"] == "U"
+
+        if table == "film_work":
+            affected[MOVIES_INDEX].add(record_id)
+        elif table == "genre":
+            affected[GENRES_INDEX].add(record_id)
+            if is_update and _changed(change, "name"):
+                renamed_genres.add(record_id)
+        elif table == "person":
+            affected[PERSONS_INDEX].add(record_id)
+            if is_update and _changed(change, "full_name"):
+                renamed_persons.add(record_id)
+        elif table == "genre_film_work":
+            affected[MOVIES_INDEX] |= _values(change, "film_work_id")
+            affected[GENRES_INDEX] |= _values(change, "genre_id")
+        elif table == "person_film_work":
+            affected[MOVIES_INDEX] |= _values(change, "film_work_id")
+            affected[PERSONS_INDEX] |= _values(change, "person_id")
+
+    return affected, renamed_genres, renamed_persons
 
 
 class AuditETL:
@@ -127,7 +142,10 @@ class AuditETL:
         # Подключаемся к Elasticsearch
         logger.info("🔌 Подключение к Elasticsearch...")
         self.es = get_es_client()
-        ensure_index(self.es)
+        for pipeline in PIPELINES:
+            if ensure_index(self.es, pipeline.index, pipeline.index_body):
+                # В схеме новые поля: документы загружаются заново, с начала.
+                self.state.set(STATE_KEY_INITIAL_LOAD.format(index=pipeline.index), MIN_UUID)
         logger.info("✅ Elasticsearch готов")
 
         logger.info(f"📌 ETL инициализирован. Последний audit_id: {self.last_audit_id}")
@@ -146,7 +164,7 @@ class AuditETL:
         try:
             with conn.cursor(cursor_factory=conn.cursor_factory) as cursor:
                 cursor.execute("""
-                    SELECT 
+                    SELECT
                         id,
                         table_name,
                         record_id,
@@ -197,356 +215,188 @@ class AuditETL:
             conn.close()
 
     @backoff(max_retries=5)
-    def fetch_movie_data(self, movie_id: str) -> Optional[Dict[str, Any]]:
-        """Получает полные данные фильма из БД.
+    def fetch_rows(self, query: str, params: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Выполняет запрос к PostgreSQL и возвращает строки-словари.
 
         Args:
-            movie_id: ID фильма
+            query: SQL-запрос с именованными параметрами
+            params: Значения параметров
 
         Returns:
-            Словарь с данными фильма или None если не найден
+            Строки результата
         """
         conn = get_pg_connection()
         try:
-            with conn.cursor(cursor_factory=conn.cursor_factory) as cursor:
-                query = FETCH_MOVIE_BY_ID.format(movie_id=movie_id)
-                cursor.execute(query)
-                result = cursor.fetchone()
-                return dict(result) if result else None
-        except Exception as e:
-            logger.error(f"❌ Ошибка при получении фильма {movie_id}: {e}")
-            raise
+            with conn.cursor() as cursor:
+                cursor.execute(query, params)
+                return [dict(row) for row in cursor.fetchall()]
         finally:
             conn.close()
 
-    def process_insert_update(self, change: Dict[str, Any]) -> bool:
-        """Обрабатывает INSERT или UPDATE запись.
+    def fetch_ids(self, query: str, ids: Iterable[str]) -> Set[str]:
+        """Выполняет запрос, возвращающий колонку id, для списка ID-параметров."""
+        ids = list(ids)
+        if not ids:
+            return set()
+        return {str(row["id"]) for row in self.fetch_rows(query, {"ids": ids})}
+
+    def sync(self, pipeline: Pipeline, ids: Iterable[str]) -> int:
+        """Синхронизирует документы индекса с PostgreSQL пачками по batch_size.
+
+        Записи, найденные в БД, индексируются, а отсутствующие удаляются из
+        индекса — так одинаково обрабатываются вставка, изменение и удаление.
 
         Args:
-            change: Словарь с изменением
+            pipeline: Пайплайн сущности
+            ids: ID записей для синхронизации
 
         Returns:
-            True если успешно, False если ошибка
+            Количество выполненных в Elasticsearch операций
         """
-        try:
-            record_id = change['record_id']
-
-            # Получаем актуальные данные из БД
-            movie_data = self.fetch_movie_data(record_id)
-
-            if not movie_data:
-                logger.warning(f"⚠️ Фильм {record_id} не найден в БД, возможно удален")
-                return False
-
-            # Трансформируем в объект Movie
-            movie = transform_row_to_movie(movie_data)
-            bulk_action = to_bulk_action(movie)
-
-            # Загружаем в Elasticsearch
-            result = self.es.index(
-                index=MOVIES_INDEX,
-                id=movie.id,
-                body=bulk_action["_source"],
-                refresh=True,  # Для тестов можно включить
-            )
-
-            if result.get('result') in ['created', 'updated']:
-                logger.debug(f"✅ Индексирован фильм: {movie.id} - {movie.title}")
-                return True
-            else:
-                logger.error(f"❌ Ошибка индексации: {movie.id}, результат: {result}")
-                return False
-
-        except Exception as e:
-            logger.error(f"❌ Ошибка при обработке INSERT/UPDATE {change.get('record_id')}: {e}")
-            self.stats["errors"] += 1
-            return False
-
-    def process_delete(self, change: Dict[str, Any]) -> bool:
-        """Обрабатывает DELETE запись.
-
-        Args:
-            change: Словарь с изменением
-
-        Returns:
-            True если успешно, False если ошибка
-        """
-        try:
-            record_id = change['record_id']
-
-            # Удаляем из Elasticsearch
-            result = self.es.delete(
-                index=MOVIES_INDEX,
-                id=record_id,
-                ignore=[404],
-                refresh=True  # Для тестов можно включить
-            )
-
-            if result.get('result') in ['deleted', 'not_found']:
-                logger.debug(f"🗑️ Удален фильм: {record_id}")
-                return True
-            else:
-                logger.warning(f"⚠️ Не удалось удалить: {record_id}, результат: {result}")
-                return False
-
-        except Exception as e:
-            logger.error(f"❌ Ошибка при удалении {change.get('record_id')}: {e}")
-            self.stats["errors"] += 1
-            return False
+        ids = sorted(set(ids))
+        total = 0
+        for start in range(0, len(ids), settings.batch_size):
+            chunk = ids[start:start + settings.batch_size]
+            rows = self.fetch_rows(pipeline.query, {"ids": chunk})
+            documents = {str(row["id"]): pipeline.transform(row) for row in rows}
+            total += sync_documents(self.es, pipeline.index, documents, chunk)
+        return total
 
     def process_changes(self, changes: List[Dict[str, Any]]) -> int:
-        """Обрабатывает список изменений с батчевой загрузкой."""
+        """Переносит в Elasticsearch изменения из аудит-лога.
+
+        Изменения отмечаются обработанными, только если все индексы успешно
+        обновлены; иначе исключение уходит в цикл run() и пачка повторится.
+        Повторная обработка безопасна: документы берутся из текущего
+        состояния БД.
+        """
         if not changes:
             return 0
 
         logger.info(f"📦 Обработка {len(changes)} изменений...")
 
-        # Группируем по операции
-        grouped = {'I': [], 'U': [], 'D': []}
+        affected, renamed_genres, renamed_persons = collect_affected_ids(changes)
+        affected[MOVIES_INDEX] |= self.fetch_ids(FETCH_FILM_IDS_BY_GENRES, renamed_genres)
+        affected[MOVIES_INDEX] |= self.fetch_ids(FETCH_FILM_IDS_BY_PERSONS, renamed_persons)
+
+        for pipeline in PIPELINES:
+            ids = affected[pipeline.index]
+            if ids:
+                logger.info(f"🔄 «{pipeline.index}»: синхронизация {len(ids)} документов")
+                self.sync(pipeline, ids)
+
+        change_ids = [change['id'] for change in changes]
+        self.mark_changes_processed(change_ids)
+        self.last_audit_id = max(change_ids)
+        self.state.set(STATE_KEY_AUDIT, str(self.last_audit_id))
+
+        operations = {'I': 'inserts', 'U': 'updates', 'D': 'deletes'}
         for change in changes:
-            op = change['operation']
-            if op in grouped:
-                grouped[op].append(change)
+            counter = operations.get(change['operation'])
+            if counter:
+                self.stats[counter] += 1
+        self.stats['total_processed'] += len(change_ids)
 
-        processed_count = 0
-        change_ids = []
-        max_audit_id = self.last_audit_id
+        self.state.increment_counter('total_processed', len(change_ids))
+        self.state.increment_counter('total_runs', 1)
+        self.state.update_statistics({
+            'last_run': datetime.now().isoformat(),
+            'last_audit_id': self.last_audit_id,
+            'inserts': self.stats['inserts'],
+            'updates': self.stats['updates'],
+            'deletes': self.stats['deletes'],
+            'errors': self.stats['errors'],
+        })
 
-        # Собираем документы для батчевой загрузки (INSERT и UPDATE)
-        bulk_actions = []
-        processed_changes = []
-
-        # Обрабатываем INSERT и UPDATE через bulk
-        for op in ['I', 'U']:
-            if not grouped.get(op):
-                continue
-
-            op_name = {'I': 'INSERT', 'U': 'UPDATE'}[op]
-            logger.info(f"🔄 Обработка {op_name}: {len(grouped[op])} записей")
-
-            for change in grouped[op]:
-                record_id = change['record_id']
-
-                # Получаем данные фильма
-                movie_data = self.fetch_movie_data(record_id)
-
-                if not movie_data:
-                    logger.warning(f"⚠️ Фильм {record_id} не найден")
-                    continue
-
-                movie = transform_row_to_movie(movie_data)
-                bulk_action = to_bulk_action(movie)
-                bulk_actions.append(bulk_action)
-                processed_changes.append(change)
-
-                if change['id'] > max_audit_id:
-                    max_audit_id = change['id']
-
-        # Загружаем батчем по 100 документов
-        if bulk_actions:
-            logger.info(f"📤 Загрузка {len(bulk_actions)} документов в Elasticsearch...")
-
-            # Разбиваем на батчи по 100
-            batch_size = 100
-            total_success = 0
-
-            for i in range(0, len(bulk_actions), batch_size):
-                batch = bulk_actions[i:i + batch_size]
-                batch_changes = processed_changes[i:i + batch_size]
-
-                success_count = bulk_upload_with_progress(
-                    self.es,
-                    batch,
-                    batch_size=100
-                )
-
-                total_success += success_count
-
-                # Отмечаем успешно загруженные изменения
-                if success_count > 0:
-                    for j in range(min(success_count, len(batch_changes))):
-                        change_ids.append(batch_changes[j]['id'])
-                        self.stats['total_processed'] += 1
-                        self.stats['inserts'] += 1
-
-        # Обрабатываем DELETE отдельно
-        if grouped.get('D'):
-            logger.info(f"🔄 Обработка DELETE: {len(grouped['D'])} записей")
-            for change in grouped['D']:
-                success = self.process_delete(change)
-                if success:
-                    processed_count += 1
-                    self.stats['deletes'] += 1
-                    change_ids.append(change['id'])
-                    if change['id'] > max_audit_id:
-                        max_audit_id = change['id']
-
-        # Отмечаем изменения как обработанные
-        if change_ids:
-            self.mark_changes_processed(change_ids)
-            self.last_audit_id = max_audit_id
-            self.state.set(STATE_KEY_AUDIT, str(self.last_audit_id))
-
-            self.state.increment_counter('total_processed', len(change_ids))
-            self.state.increment_counter('total_runs', 1)
-
-            self.state.update_statistics({
-                'last_run': datetime.now().isoformat(),
-                'last_audit_id': self.last_audit_id,
-                'inserts': self.stats['inserts'],
-                'updates': self.stats['updates'],
-                'deletes': self.stats['deletes'],
-                'errors': self.stats['errors'],
-            })
-
-            logger.info(f"💾 Состояние сохранено в БД: audit_id={self.last_audit_id}")
-
+        logger.info(f"💾 Состояние сохранено в БД: audit_id={self.last_audit_id}")
         return len(change_ids)
 
-    def check_elasticsearch_data(self) -> int:
-        """Проверяет, есть ли данные в Elasticsearch."""
-        try:
-            result = self.es.count(index=MOVIES_INDEX)
-            count = result.get('count', 0)
-            logger.info(f"📊 В Elasticsearch найдено {count} документов")
-            return count
-        except Exception as e:
-            logger.error(f"❌ Ошибка при проверке данных в Elasticsearch: {e}")
-            return 0
+    def count_documents(self, index: str) -> int:
+        """Возвращает количество документов в индексе."""
+        count = self.es.count(index=index).get('count', 0)
+        logger.info(f"📊 В индексе «{index}» найдено {count} документов")
+        return count
 
-    def initial_load(self) -> int:
-        """Выполняет начальную загрузку всех фильмов из PostgreSQL в Elasticsearch."""
-        logger.info("📦 Начальная загрузка всех фильмов...")
+    def initial_load(self, pipeline: Pipeline, last_id: str) -> int:
+        """Загружает все записи таблицы пайплайна в индекс.
 
-        conn = get_pg_connection()
-        try:
-            with conn.cursor(cursor_factory=conn.cursor_factory) as cursor:
-                # Получаем все фильмы с пагинацией
-                offset = 0
-                batch_size = 100
-                total_loaded = 0
+        Записи перебираются по возрастанию ID, после каждой пачки ID
+        сохраняется в состоянии — после перезапуска загрузка продолжится
+        с места остановки.
 
-                while True:
-                    # Запрос с пагинацией
-                    cursor.execute("""
-                        SELECT fw.id,
-                               fw.rating AS imdb_rating,
-                               fw.title,
-                               fw.description,
-                               fw.modified,
-                               fw.creation_date,
-                               COALESCE(
-                                   json_agg(
-                                       DISTINCT jsonb_build_object('id', g.id, 'name', g.name)
-                                   ) FILTER (WHERE g.id IS NOT NULL),
-                                   '[]'::json
-                               ) AS genres,
-                               COALESCE(
-                                   json_agg(
-                                       DISTINCT jsonb_build_object(
-                                           'id', p.id,
-                                           'name', p.full_name,
-                                           'role', pfw.role
-                                       )
-                                   ) FILTER (WHERE p.id IS NOT NULL),
-                                   '[]'::json
-                               ) AS persons
-                        FROM content.film_work fw
-                        LEFT JOIN content.genre_film_work  gfw  ON gfw.film_work_id = fw.id
-                        LEFT JOIN content.genre            g    ON g.id = gfw.genre_id
-                        LEFT JOIN content.person_film_work pfw  ON pfw.film_work_id = fw.id
-                        LEFT JOIN content.person           p    ON p.id = pfw.person_id
-                        GROUP BY fw.id, fw.rating, fw.title, fw.description, fw.modified, fw.creation_date
-                        ORDER BY fw.modified, fw.id
-                        LIMIT %s OFFSET %s
-                    """, (batch_size, offset))
+        Args:
+            pipeline: Пайплайн сущности
+            last_id: ID, после которого продолжить загрузку
 
-                    movies = [dict(row) for row in cursor.fetchall()]
+        Returns:
+            Количество выполненных в Elasticsearch операций
+        """
+        logger.info(f"📦 Начальная загрузка «{pipeline.index}» после ID {last_id}...")
+        state_key = STATE_KEY_INITIAL_LOAD.format(index=pipeline.index)
+        query = FETCH_IDS_PAGE.format(table=pipeline.table)
+        total = 0
 
-                    if not movies:
-                        break
+        while True:
+            rows = self.fetch_rows(query, {"last_id": last_id, "limit": settings.batch_size})
+            if not rows:
+                break
 
-                    logger.info(f"📦 Загрузка пакета {offset // batch_size + 1}: {len(movies)} фильмов")
+            ids = [str(row["id"]) for row in rows]
+            total += self.sync(pipeline, ids)
+            last_id = ids[-1]
+            self.state.set(state_key, last_id)
 
-                    # Трансформируем и загружаем
-                    transformed = [transform_row_to_movie(row) for row in movies]
-                    bulk_actions = [to_bulk_action(m) for m in transformed]
-
-                    success = bulk_upload_with_progress(self.es, bulk_actions, batch_size=100)
-                    total_loaded += success
-
-                    # Обновляем состояние для каждого пакета
-                    if movies:
-                        last_modified = movies[-1]['modified']
-                        if hasattr(last_modified, 'isoformat'):
-                            last_modified = last_modified.isoformat()
-                        else:
-                            last_modified = str(last_modified)
-                        self.state.set(STATE_KEY_MODIFIED, last_modified)
-
-                    offset += batch_size
-
-                    # Небольшая пауза между пакетами
-                    time.sleep(0.1)
-
-                logger.info(f"✅ Начальная загрузка завершена: {total_loaded} фильмов")
-                return total_loaded
-
-        except Exception as e:
-            logger.error(f"❌ Ошибка при начальной загрузке: {e}")
-            raise
-        finally:
-            conn.close()
+        self.state.set(state_key, LOAD_DONE)
+        logger.info(f"✅ Начальная загрузка «{pipeline.index}» завершена: {total} операций")
+        return total
 
     def ensure_elasticsearch_data(self):
-        """Проверяет и при необходимости загружает данные в Elasticsearch."""
-        # Проверяем, есть ли данные в Elasticsearch
-        count = self.check_elasticsearch_data()
+        """Выполняет начальную загрузку индексов, которые ещё не загружены.
 
-        if count > 0:
-            logger.info(f"✅ В Elasticsearch уже есть {count} документов, начальная загрузка не требуется")
-            return
+        Пустой индекс загружается с начала, незавершённая загрузка
+        продолжается с сохранённого ID.
+        """
+        for pipeline in PIPELINES:
+            state_key = STATE_KEY_INITIAL_LOAD.format(index=pipeline.index)
+            progress = self.state.get(state_key)
 
-        logger.info("📭 Elasticsearch пуст, выполняю начальную загрузку...")
+            if self.count_documents(pipeline.index) == 0:
+                progress = MIN_UUID
+            elif progress == LOAD_DONE:
+                logger.info(f"✅ Индекс «{pipeline.index}» уже загружен")
+                continue
 
-        # Проверяем, есть ли данные в audit_log
-        conn = get_pg_connection()
-        try:
-            with conn.cursor() as cursor:
-                cursor.execute("SELECT COUNT(*) FROM content.audit_log WHERE processed = TRUE")
-                processed_count = cursor.fetchone()[0]
+            self.initial_load(pipeline, last_id=str(progress or MIN_UUID))
 
-                if processed_count > 0:
-                    logger.info(f"📊 В audit_log уже есть {processed_count} обработанных записей")
-                    # Проверяем, сколько всего фильмов в БД
-                    cursor.execute("SELECT COUNT(*) FROM content.film_work")
-                    total_films = cursor.fetchone()[0]
+    def refresh_access_levels(self, today: Optional[date] = None) -> int:
+        """Раз в сутки снимает метку «по подписке» с фильмов, которые перестали быть новинками.
 
-                    if processed_count < total_films:
-                        logger.info(f"📝 Добавляем недостающие записи в audit_log...")
-                        cursor.execute("""
-                            INSERT INTO content.audit_log (table_name, record_id, operation, new_data, processed)
-                            SELECT 
-                                'film_work'::VARCHAR,
-                                fw.id::VARCHAR,
-                                'I'::CHAR,
-                                to_jsonb(fw.*),
-                                FALSE
-                            FROM content.film_work fw
-                            WHERE NOT EXISTS (
-                                SELECT 1 FROM content.audit_log al 
-                                WHERE al.record_id = fw.id::VARCHAR
-                                AND al.table_name = 'film_work'
-                            )
-                        """)
-                        conn.commit()
-                        logger.info(f"✅ Добавлено {cursor.rowcount} записей в audit_log")
+        Метка вычисляется при индексации фильма и сама не меняется, а фильм
+        выходит из новинок просто с течением времени. Поэтому за каждый день
+        с прошлой проверки переиндексируются фильмы, у которых срок новинки
+        истёк в этот промежуток. Первый запуск только запоминает дату:
+        начальная загрузка уже расставила метки на сегодня.
 
-        finally:
-            conn.close()
+        Returns:
+            Количество переиндексированных фильмов
+        """
+        today = today or date.today()
+        checked = self.state.get(STATE_KEY_ACCESS_LEVELS)
+        if checked == today.isoformat():
+            return 0
 
-        # Выполняем начальную загрузку
-        self.initial_load()
+        ids: List[str] = []
+        if checked:
+            rows = self.fetch_rows(FETCH_FILM_IDS_LEAVING_SUBSCRIPTION, {
+                "since": subscription_threshold(date.fromisoformat(checked)),
+                "until": subscription_threshold(today),
+            })
+            ids = [str(row["id"]) for row in rows]
+        if ids:
+            logger.info(f"🔄 Фильмов, которые больше не новинки: {len(ids)}")
+            self.sync(MOVIES_PIPELINE, ids)
+        self.state.set(STATE_KEY_ACCESS_LEVELS, today.isoformat())
+        return len(ids)
 
     def print_statistics(self):
         """Выводит статистику работы ETL."""
@@ -573,6 +423,8 @@ class AuditETL:
         Returns:
             Количество обработанных изменений
         """
+        self.refresh_access_levels()
+
         # Получаем новые изменения
         changes = self.get_unprocessed_changes()
 
@@ -581,12 +433,7 @@ class AuditETL:
 
         logger.info(f"🔍 Найдено {len(changes)} необработанных изменений")
         processed = self.process_changes(changes)
-
-        if processed > 0:
-            logger.info(f"✅ Обработано {processed} изменений")
-        else:
-            logger.warning("⚠️ Не удалось обработать изменения")
-
+        logger.info(f"✅ Обработано {processed} изменений")
         return processed
 
     def run(self):
@@ -596,10 +443,6 @@ class AuditETL:
 
         # Проверяем и загружаем данные в Elasticsearch при первом старте
         self.ensure_elasticsearch_data()
-
-        # Получаем актуальный last_audit_id после начальной загрузки
-        self.last_audit_id = int(self.state.get(STATE_KEY_AUDIT, 0))
-        logger.info(f"📌 Обновленный audit_id: {self.last_audit_id}")
 
         empty_cycles = 0
         poll_interval = getattr(settings, 'poll_interval', 10)
@@ -629,6 +472,7 @@ class AuditETL:
                 logger.info("🛑 ETL остановлен пользователем")
                 break
             except Exception as e:
+                self.stats['errors'] += 1
                 logger.error(f"❌ Критическая ошибка: {e}", exc_info=True)
                 logger.info(f"⏳ Повторная попытка через {poll_interval}с...")
                 time.sleep(poll_interval)

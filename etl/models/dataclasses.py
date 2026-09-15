@@ -4,6 +4,8 @@ from dataclasses import dataclass, field, asdict
 from typing import Optional
 from datetime import date
 
+from access import access_level
+
 
 @dataclass
 class Person:
@@ -59,4 +61,40 @@ class Movie:
             ],
             "actors_names": [p.name for p in self.actors],
             "writers_names": [p.name for p in self.writers],
+            "creation_date": self.creation_date.isoformat() if self.creation_date else None,
+            "access_level": access_level(self.creation_date),
         }
+
+
+@dataclass
+class GenreDocument:
+    """Жанр для индекса genres."""
+
+    id: str
+    name: str
+    description: Optional[str] = None
+
+    def to_es_document(self) -> dict:
+        """Преобразует жанр в документ для Elasticsearch."""
+        return asdict(self)
+
+
+@dataclass
+class PersonFilm:
+    """Фильм персоны и её роли в этом фильме."""
+
+    id: str
+    roles: list[str] = field(default_factory=list)
+
+
+@dataclass
+class PersonDocument:
+    """Персона для индекса persons."""
+
+    id: str
+    full_name: str
+    films: list[PersonFilm] = field(default_factory=list)
+
+    def to_es_document(self) -> dict:
+        """Преобразует персону в документ для Elasticsearch."""
+        return asdict(self)
