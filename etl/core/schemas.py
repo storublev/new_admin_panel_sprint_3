@@ -66,6 +66,9 @@ MOVIES_MAPPING = {
         "writers": PERSON_MAPPING,
         "actors_names": {"type": "text", "analyzer": "ru_en"},
         "writers_names": {"type": "text", "analyzer": "ru_en"},
+        # Дата выхода и метка доступа: public — всем, subscription — по подписке.
+        "creation_date": {"type": "date"},
+        "access_level": {"type": "keyword"},
     },
 }
 

@@ -53,20 +53,39 @@ def get_es_client() -> Elasticsearch:
     return _connect()
 
 
-def ensure_index(client: Elasticsearch, index: str, body: dict) -> None:
-    """Создаёт индекс, если он ещё не существует.
+def ensure_index(client: Elasticsearch, index: str, body: dict) -> bool:
+    """Создаёт индекс или добавляет в его маппинг новые поля.
+
+    Маппинг строгий (dynamic: strict): документ с полем, которого нет в
+    маппинге, Elasticsearch не примет. Поэтому, когда в схеме появляются
+    новые поля, они добавляются в маппинг существующего индекса — добавлять
+    поля можно без пересоздания индекса. Уже загруженные документы этих полей
+    не содержат, их нужно переиндексировать.
 
     Args:
         client: Клиент Elasticsearch.
         index: Имя индекса.
         body: Настройки и маппинг индекса.
+
+    Returns:
+        True, если в маппинг добавлены поля и документы надо загрузить заново.
     """
     if not client.indices.exists(index=index):
         logger.info("Создаю индекс «%s»…", index)
         client.indices.create(index=index, body=body)
         logger.info("Индекс «%s» создан.", index)
-    else:
+        return False
+
+    properties = body["mappings"]["properties"]
+    current = client.indices.get_mapping(index=index)[index]["mappings"].get("properties", {})
+    missing = {name: mapping for name, mapping in properties.items() if name not in current}
+    if not missing:
         logger.debug("Индекс «%s» уже существует.", index)
+        return False
+
+    client.indices.put_mapping(index=index, properties=missing)
+    logger.info("В маппинг «%s» добавлены поля: %s", index, ", ".join(missing))
+    return True
 
 
 def sync_documents(

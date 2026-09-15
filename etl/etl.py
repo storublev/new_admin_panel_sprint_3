@@ -12,15 +12,21 @@
 import logging
 import sys
 import time
-from datetime import datetime
-from typing import Any, Dict, Iterable, List, Set, Tuple
+from datetime import date, datetime
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
+from access import subscription_threshold
 from core.config import settings
-from core.queries import FETCH_FILM_IDS_BY_GENRES, FETCH_FILM_IDS_BY_PERSONS, FETCH_IDS_PAGE
+from core.queries import (
+    FETCH_FILM_IDS_BY_GENRES,
+    FETCH_FILM_IDS_BY_PERSONS,
+    FETCH_FILM_IDS_LEAVING_SUBSCRIPTION,
+    FETCH_IDS_PAGE,
+)
 from core.schemas import GENRES_INDEX, MOVIES_INDEX, PERSONS_INDEX
 from db.elastic import ensure_index, get_es_client, sync_documents
 from db.postgres import backoff, get_pg_connection
-from pipelines import PIPELINES, Pipeline
+from pipelines import MOVIES_PIPELINE, PIPELINES, Pipeline
 from state import DatabaseStateStorage, State
 
 # Настройка логирования
@@ -38,6 +44,8 @@ STATE_KEY_AUDIT = "last_audit_id"
 # Прогресс начальной загрузки индекса: последний загруженный ID или LOAD_DONE
 STATE_KEY_INITIAL_LOAD = "initial_load:{index}"
 LOAD_DONE = "done"
+# Дата, на которую метки доступа фильмов в индексе актуальны
+STATE_KEY_ACCESS_LEVELS = "access_levels_date"
 MIN_UUID = "00000000-0000-0000-0000-000000000000"
 
 
@@ -135,7 +143,9 @@ class AuditETL:
         logger.info("🔌 Подключение к Elasticsearch...")
         self.es = get_es_client()
         for pipeline in PIPELINES:
-            ensure_index(self.es, pipeline.index, pipeline.index_body)
+            if ensure_index(self.es, pipeline.index, pipeline.index_body):
+                # В схеме новые поля: документы загружаются заново, с начала.
+                self.state.set(STATE_KEY_INITIAL_LOAD.format(index=pipeline.index), MIN_UUID)
         logger.info("✅ Elasticsearch готов")
 
         logger.info(f"📌 ETL инициализирован. Последний audit_id: {self.last_audit_id}")
@@ -358,6 +368,36 @@ class AuditETL:
 
             self.initial_load(pipeline, last_id=str(progress or MIN_UUID))
 
+    def refresh_access_levels(self, today: Optional[date] = None) -> int:
+        """Раз в сутки снимает метку «по подписке» с фильмов, которые перестали быть новинками.
+
+        Метка вычисляется при индексации фильма и сама не меняется, а фильм
+        выходит из новинок просто с течением времени. Поэтому за каждый день
+        с прошлой проверки переиндексируются фильмы, у которых срок новинки
+        истёк в этот промежуток. Первый запуск только запоминает дату:
+        начальная загрузка уже расставила метки на сегодня.
+
+        Returns:
+            Количество переиндексированных фильмов
+        """
+        today = today or date.today()
+        checked = self.state.get(STATE_KEY_ACCESS_LEVELS)
+        if checked == today.isoformat():
+            return 0
+
+        ids: List[str] = []
+        if checked:
+            rows = self.fetch_rows(FETCH_FILM_IDS_LEAVING_SUBSCRIPTION, {
+                "since": subscription_threshold(date.fromisoformat(checked)),
+                "until": subscription_threshold(today),
+            })
+            ids = [str(row["id"]) for row in rows]
+        if ids:
+            logger.info(f"🔄 Фильмов, которые больше не новинки: {len(ids)}")
+            self.sync(MOVIES_PIPELINE, ids)
+        self.state.set(STATE_KEY_ACCESS_LEVELS, today.isoformat())
+        return len(ids)
+
     def print_statistics(self):
         """Выводит статистику работы ETL."""
         stats = self.state.get_statistics()
@@ -383,6 +423,8 @@ class AuditETL:
         Returns:
             Количество обработанных изменений
         """
+        self.refresh_access_levels()
+
         # Получаем новые изменения
         changes = self.get_unprocessed_changes()
 

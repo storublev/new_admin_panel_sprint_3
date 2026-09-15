@@ -91,6 +91,15 @@ FROM content.person_film_work
 WHERE person_id = ANY(%(ids)s::uuid[])
 """
 
+# Фильмы, у которых срок «новинки» истёк после since и не позже until:
+# их метку доступа нужно сменить с subscription на public.
+FETCH_FILM_IDS_LEAVING_SUBSCRIPTION = """
+SELECT id
+FROM content.film_work
+WHERE creation_date > %(since)s
+  AND creation_date <= %(until)s
+"""
+
 # Запрос для получения измененных фильмов (с пагинацией)
 FETCH_MODIFIED_MOVIES = """
 WITH recently_modified AS (

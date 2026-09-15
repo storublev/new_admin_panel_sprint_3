@@ -4,6 +4,8 @@ from dataclasses import dataclass, field, asdict
 from typing import Optional
 from datetime import date
 
+from access import access_level
+
 
 @dataclass
 class Person:
@@ -59,6 +61,8 @@ class Movie:
             ],
             "actors_names": [p.name for p in self.actors],
             "writers_names": [p.name for p in self.writers],
+            "creation_date": self.creation_date.isoformat() if self.creation_date else None,
+            "access_level": access_level(self.creation_date),
         }
 
 
